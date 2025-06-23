@@ -26,3 +26,8 @@ clap = { version = "4.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1.0"
+threshold_crypto = { version = "0.4", git = "https://github.com/poanetwork/threshold_crypto" }
+rand = { version = "0.7"}
+sha2 = "0.10"
+hex = "0.4"
+bincode = "1.3"
