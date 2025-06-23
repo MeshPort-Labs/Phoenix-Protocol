@@ -83,11 +83,12 @@ pub struct PhoenixNode {
     seen_messages: HashSet<String>,
     crypto: ThresholdCrypto,
     pending_encrypted_messages: HashMap<String, EncryptedMessage>,
-    my_decryption_shares: HashMap<String, DecryptionShare>
+    my_decryption_shares: HashMap<String, DecryptionShare>,
+    _node_name: String,
 }
 
 impl PhoenixNode {
-    pub async fn new(topic_str: &str, shard_id: usize) -> anyhow::Result<Self> {
+    pub async fn new(topic_str: &str, shard_id: usize, name: String) -> anyhow::Result<Self> {
         let id_keys = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(id_keys.public());
         info!("Local peer id: {:?}", local_peer_id);
@@ -139,7 +140,7 @@ impl PhoenixNode {
         let crypto = ThresholdCrypto::generate_keys(3, 5, shard_id)
             .map_err(|e| anyhow::anyhow!("Crypto initialization failed: {:?}", e))?;
         
-        info!("🔐 Crypto initialized: {}", crypto.get_info());
+        info!("🔐 Node '{}' crypto initialized: {}", name, crypto.get_info());
 
         Ok(Self { 
             swarm, 
@@ -148,6 +149,7 @@ impl PhoenixNode {
             crypto, 
             pending_encrypted_messages: HashMap::new(),
             my_decryption_shares: HashMap::new(),
+            _node_name: name,
         })
     }
 
