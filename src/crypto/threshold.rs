@@ -1,16 +1,24 @@
-// use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+
 use threshold_crypto::{PublicKeySet, SecretKeySet, SecretKeyShare};
 use anyhow::Result;
 use std::fmt;
 use rand::SeedableRng;
+use std::collections::BTreeMap;
 
 pub struct ThresholdCrypto {
     pub threshold: usize,
     pub total_shards: usize,
     pub my_shard_id: usize,
-    secret_key_set: SecretKeySet,
+    _secret_key_set: SecretKeySet,
     public_key_set: PublicKeySet,
     my_secret_share: SecretKeyShare,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DecryptionShare {
+    pub shard_id: usize,
+    pub share_data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -51,7 +59,7 @@ impl ThresholdCrypto {
             threshold,
             total_shards,
             my_shard_id,
-            secret_key_set,
+            _secret_key_set: secret_key_set,
             public_key_set,
             my_secret_share,
         })
@@ -93,5 +101,55 @@ impl ThresholdCrypto {
         // Serialize ciphertext for network transmission
         bincode::serialize(&ciphertext)
             .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))
+    }
+
+    pub fn create_decryption_share(&self, ciphertext_bytes: &[u8]) -> Result<DecryptionShare, CryptoError> {
+        // Deserialize ciphertext
+        let ciphertext: threshold_crypto::Ciphertext = bincode::deserialize(ciphertext_bytes)
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+        
+        // Create decryption share
+        let dec_share = self.my_secret_share.decrypt_share(&ciphertext)
+            .ok_or_else(|| CryptoError::DecryptionFailed("Failed to create decryption share".to_string()))?;
+        
+        // Serialize the share
+        let share_data = bincode::serialize(&dec_share)
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+        
+        Ok(DecryptionShare {
+            shard_id: self.my_shard_id,
+            share_data,
+        })
+    }
+
+    pub fn combine_shares_and_decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+        shares: &[DecryptionShare]
+    ) -> Result<String, CryptoError> {
+        if shares.len() < self.threshold {
+            return Err(CryptoError::DecryptionFailed(
+                format!("Need {} shares, have {}", self.threshold, shares.len())
+            ));
+        }
+        
+        // Deserialize ciphertext
+        let ciphertext: threshold_crypto::Ciphertext = bincode::deserialize(ciphertext_bytes)
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+        
+        // Deserialize shares into BTreeMap
+        let mut share_map = BTreeMap::new();
+        for dec_share in shares.iter().take(self.threshold) {
+            let share: threshold_crypto::DecryptionShare = bincode::deserialize(&dec_share.share_data)
+                .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+            share_map.insert(dec_share.shard_id, share);
+        }
+        
+        // Decrypt
+        let decrypted_bytes = self.public_key_set.decrypt(&share_map, &ciphertext)
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+        
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
     }
 }
