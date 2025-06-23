@@ -2,7 +2,7 @@ use libp2p::{
     gossipsub, identity,
     mdns, noise, swarm::{Swarm, SwarmEvent}, tcp, yamux, PeerId, Transport
 };
-use std::{time::Duration, hash::{Hash, Hasher, DefaultHasher}};
+use std::{collections::HashMap, hash::{DefaultHasher, Hash, Hasher}, time::Duration};
 use tokio::io::{self, AsyncBufReadExt};
 use tracing::{info, warn};
 use libp2p::swarm::NetworkBehaviour;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
-use crate::crypto::{ThresholdCrypto, EncryptedMessage };
+use crate::crypto::{DecryptionShare, EncryptedMessage, ThresholdCrypto };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PhoenixMessage {
@@ -82,6 +82,8 @@ pub struct PhoenixNode {
     local_peer_id: PeerId,
     seen_messages: HashSet<String>,
     crypto: ThresholdCrypto,
+    pending_encrypted_messages: HashMap<String, EncryptedMessage>,
+    my_decryption_shares: HashMap<String, DecryptionShare>
 }
 
 impl PhoenixNode {
@@ -137,13 +139,15 @@ impl PhoenixNode {
         let crypto = ThresholdCrypto::generate_keys(3, 5, shard_id)
             .map_err(|e| anyhow::anyhow!("Crypto initialization failed: {:?}", e))?;
         
-        info!("Crypto initialized: {}", crypto.get_info());
+        info!("🔐 Crypto initialized: {}", crypto.get_info());
 
         Ok(Self { 
             swarm, 
             local_peer_id, 
             seen_messages: HashSet::new(),
             crypto, 
+            pending_encrypted_messages: HashMap::new(),
+            my_decryption_shares: HashMap::new(),
         })
     }
 
@@ -196,6 +200,23 @@ impl PhoenixNode {
         }
     }
 
+    fn handle_encrypted_message(&mut self, encrypted_msg: EncryptedMessage) {
+        let msg_id = encrypted_msg.id.clone();
+        
+        match self.crypto.create_decryption_share(&encrypted_msg.encrypted_content) {
+            Ok(share) => {
+                info!("🔑 Created decryption share for message {} (shard {})", msg_id, share.shard_id);
+                
+                // Storing the message and our share
+                self.pending_encrypted_messages.insert(msg_id.clone(), encrypted_msg);
+                self.my_decryption_shares.insert(msg_id, share);
+            }
+            Err(e) => {
+                warn!("❌ Failed to create decryption share: {:?}", e);
+            }
+        }
+    }
+
     fn route_message(&mut self, topic: &gossipsub::IdentTopic, msg_bytes: &[u8]) {
         // Try to parse as PhoenixMessageType first
         match serde_json::from_slice::<PhoenixMessageType>(msg_bytes) {
@@ -216,7 +237,6 @@ impl PhoenixNode {
                 }
             }
             Ok(PhoenixMessageType::Encrypted(mut encrypted_msg)) => {
-                // NEW: Handle encrypted messages
                 if self.seen_messages.contains(&encrypted_msg.id) {
                     return;
                 }
@@ -225,7 +245,8 @@ impl PhoenixNode {
                 info!("🔒 Encrypted message from {} (ID: {}, needs {}/{} shares)", 
                       encrypted_msg.sender, encrypted_msg.id, encrypted_msg.threshold_needed, 5);
                 
-                // For now, just forward the message (decryption comes later)
+                self.handle_encrypted_message(encrypted_msg.clone());
+
                 if encrypted_msg.decrement_ttl() {
                     let msg_type = PhoenixMessageType::Encrypted(encrypted_msg);
                     if let Ok(serialized) = serde_json::to_vec(&msg_type) {
@@ -234,7 +255,7 @@ impl PhoenixNode {
                 }
             }
             Err(_) => {
-                // Fallback for old format messages
+                // Fallback for raw messages
                 info!("📨 Raw: {}", String::from_utf8_lossy(msg_bytes));
             }
         }
@@ -255,7 +276,6 @@ impl PhoenixNode {
                     let line = line?.unwrap_or_default();
                     if !line.is_empty() {
                         if line.starts_with("/encrypt ") {
-                            // NEW: Handle encrypted message command
                             let content = line.strip_prefix("/encrypt ").unwrap_or("");
                             let connected_peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
                             
@@ -266,20 +286,9 @@ impl PhoenixNode {
                                     warn!("❌ Failed to send encrypted message: {:?}", e);
                                 }
                             }
-                        } else if line == "/test-encrypt" {
-                            // ADD: Test encryption command
-                            println!("🔐 Testing message encryption...");
-                            match self.crypto.encrypt_message("test message") {
-                                Ok(encrypted_bytes) => {
-                                    println!("✅ Encrypted 'test message' -> {} bytes", encrypted_bytes.len());
-                                    println!("✅ Message serialization works");
-                                }
-                                Err(e) => {
-                                    println!("❌ Encryption failed: {:?}", e);
-                                }
-                            }
-                        } else {
-                            // Existing plain text message logic
+                        } 
+                        else {
+                            // plain text message logic
                             let (ttl, content) = if line.contains(':') {
                                 let parts: Vec<&str> = line.splitn(2, ':').collect();
                                 if parts.len() == 2 {
