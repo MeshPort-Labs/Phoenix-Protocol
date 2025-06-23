@@ -7,6 +7,43 @@ use tokio::io::{self, AsyncBufReadExt};
 use tracing::{info, warn};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::futures::StreamExt;
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use std::collections::HashSet;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PhoenixMessage {
+    pub id: String,
+    pub sender: String,  
+    pub content: Vec<u8>,
+    pub timestamp: DateTime<Utc>,
+    pub ttl: u32,
+    pub hop_count: u32,
+}
+
+impl PhoenixMessage {
+    pub fn new(sender: PeerId, content: Vec<u8>, initial_ttl: u32) -> Self {
+        Self { 
+            id: Uuid::new_v4().to_string(), 
+            sender: sender.to_string(), 
+            content, 
+            timestamp: Utc::now(), 
+            ttl: initial_ttl, 
+            hop_count: 0 
+        }
+    }
+
+    pub fn decrement_ttl(&mut self) -> bool {
+        if self.ttl > 0 {
+            self.ttl -= 1;
+            self.hop_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "PhoenixEvent")]
@@ -34,7 +71,8 @@ impl From<mdns::Event> for PhoenixEvent {
 
 pub struct PhoenixNode {
     swarm: Swarm<PhoenixBehaviour>,
-    _local_peer_id: PeerId,
+    local_peer_id: PeerId,
+    seen_messages: HashSet<String>
 }
 
 impl PhoenixNode {
@@ -87,7 +125,59 @@ impl PhoenixNode {
             swarm_config,
         );
 
-        Ok(Self { swarm, _local_peer_id: local_peer_id })
+        Ok(Self { swarm, local_peer_id, seen_messages: HashSet::new() })
+    }
+
+    pub async fn send_message(&mut self, topic: &gossipsub::IdentTopic, content: Vec<u8>, ttl: u32) -> anyhow::Result<()> {
+        let phoenix_msg = PhoenixMessage::new(self.local_peer_id, content, ttl);
+        info!("i8Sending message ID: {} with TTL: {}", phoenix_msg.id, phoenix_msg.ttl);
+
+        let serialized = serde_json::to_vec(&phoenix_msg)?;
+
+        self.seen_messages.insert(phoenix_msg.id.clone());
+
+        match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized) {
+            Ok(_) => {
+                info!("Message published successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to publish message: {:?}", e);
+                Err(anyhow::anyhow!("Failed to publish: {:?}", e))
+            }
+        }
+    }
+
+    fn route_message(&mut self, topic: &gossipsub::IdentTopic, mut phoenix_msg: PhoenixMessage) {
+        // Check if we've seen this message before
+        if self.seen_messages.contains(&phoenix_msg.id) {
+            info!("Already seen message {}, skipping", phoenix_msg.id);
+            return;
+        }
+
+        self.seen_messages.insert(phoenix_msg.id.clone());
+
+        info!(
+            "Received message ID: {} from {} (TTL: {}, Hops: {}): {}", 
+            phoenix_msg.id,
+            phoenix_msg.sender,
+            phoenix_msg.ttl,
+            phoenix_msg.hop_count,
+            String::from_utf8_lossy(&phoenix_msg.content)
+        );
+
+        // Check if we should forward this message
+        if phoenix_msg.decrement_ttl() {
+            info!("Forwarding message {} with new TTL: {}", phoenix_msg.id, phoenix_msg.ttl);
+            
+            if let Ok(serialized) = serde_json::to_vec(&phoenix_msg) {
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized) {
+                    warn!("Failed to forward message: {:?}", e);
+                }
+            }
+        } else {
+            info!("Message {} TTL expired, not forwarding", phoenix_msg.id);
+        }
     }
 
     pub async fn run(mut self, topic_str: &str) -> anyhow::Result<()> {
@@ -97,21 +187,38 @@ impl PhoenixNode {
 
         let mut stdin = io::BufReader::new(io::stdin()).lines();
 
+        info!("🚀 Phoenix node started! Type messages to send (format: 'ttl:message' or just 'message' for TTL=5)");
+
         loop {
             tokio::select! {
                 line = stdin.next_line() => {
                     let line = line?.unwrap_or_default();
                     if !line.is_empty() {
-                        // Checking connected peers before publishing
+                        // Parse input: either "ttl:message" or just "message"
+                        let (ttl, content) = if line.contains(':') {
+                            let parts: Vec<&str> = line.splitn(2, ':').collect();
+                            if parts.len() == 2 {
+                                if let Ok(ttl) = parts[0].parse::<u32>() {
+                                    (ttl, parts[1].to_string())
+                                } else {
+                                    (5, line.clone()) // Default TTL if parse fails
+                                }
+                            } else {
+                                (5, line.clone()) // Default TTL
+                            }
+                        } else {
+                            (5, line.clone()) // Default TTL
+                        };
+
+                        // Check connected peers before publishing
                         let connected_peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
                         info!("Connected peers: {} total", connected_peers.len());
                         
                         if connected_peers.is_empty() {
                             warn!("No connected peers yet, try again in a moment");
                         } else {
-                            match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), line.as_bytes()) {
-                                Ok(_) => info!("Message published successfully to {} peers", connected_peers.len()),
-                                Err(e) => warn!("Failed to publish message: {:?}", e),
+                            if let Err(e) = self.send_message(&topic, content.as_bytes().to_vec(), ttl).await {
+                                warn!("Failed to send message: {:?}", e);
                             }
                         }
                     }
@@ -125,20 +232,31 @@ impl PhoenixNode {
                         message,
                         ..
                     })) => {
-                        info!(
-                             "Received from {:?}: {}",
-                            propagation_source,
-                            String::from_utf8_lossy(&message.data)
-                        );
+                        // parse Phoenix message and route it
+                        match serde_json::from_slice::<PhoenixMessage>(&message.data) {
+                            Ok(phoenix_msg) => {
+                                // Only route if it's not from ourselves
+                                if phoenix_msg.sender != self.local_peer_id.to_string() {
+                                    self.route_message(&topic, phoenix_msg);
+                                }
+                            }
+                            Err(e) => {
+                                // Fallback for non-Phoenix messages
+                                info!(
+                                    "Raw message from {:?}: {} (Parse error: {})",
+                                    propagation_source,
+                                    String::from_utf8_lossy(&message.data),
+                                    e
+                                );
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(PhoenixEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
-                            info!("mDNS discovered peer: {}", peer_id);
+                            info!("🔍 mDNS discovered peer: {}", peer_id);
                             
-                            // Add peer to gossipsub
                             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             
-                            // Dial the peer with explicit error handling
                             match self.swarm.dial(multiaddr.clone()) {
                                 Ok(_) => info!("Dialing peer {}", peer_id),
                                 Err(e) => warn!("Failed to dial peer {}: {:?}", peer_id, e),
@@ -154,7 +272,6 @@ impl PhoenixNode {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         info!("Connection established with: {:?} (connection: {:?})", peer_id, connection_id);
                         
-                        // Force gossipsub to recognize this peer 
                         self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         
                         tokio::spawn(async move {
