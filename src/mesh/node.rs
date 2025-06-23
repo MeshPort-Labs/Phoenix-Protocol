@@ -12,7 +12,7 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
-use crate::crypto::{DecryptionShare, EncryptedMessage, ThresholdCrypto };
+use crate::crypto::{DecryptionShare, EncryptedMessage, ShareRequest, ShareResponse, ThresholdCrypto };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PhoenixMessage {
@@ -28,6 +28,8 @@ pub struct PhoenixMessage {
 pub enum PhoenixMessageType {
     PlainText(PhoenixMessage),
     Encrypted(EncryptedMessage),
+    ShareRequest(ShareRequest),
+    ShareResponse(ShareResponse),
 }
 
 impl PhoenixMessage {
@@ -85,6 +87,7 @@ pub struct PhoenixNode {
     pending_encrypted_messages: HashMap<String, EncryptedMessage>,
     my_decryption_shares: HashMap<String, DecryptionShare>,
     _node_name: String,
+    collected_shares: HashMap<String, Vec<DecryptionShare>>,
 }
 
 impl PhoenixNode {
@@ -150,6 +153,7 @@ impl PhoenixNode {
             pending_encrypted_messages: HashMap::new(),
             my_decryption_shares: HashMap::new(),
             _node_name: name,
+            collected_shares: HashMap::new(),
         })
     }
 
@@ -202,20 +206,115 @@ impl PhoenixNode {
         }
     }
 
-    fn handle_encrypted_message(&mut self, encrypted_msg: EncryptedMessage) {
+    fn handle_encrypted_message(&mut self, topic: &gossipsub::IdentTopic, encrypted_msg: EncryptedMessage) {
         let msg_id = encrypted_msg.id.clone();
         
         match self.crypto.create_decryption_share(&encrypted_msg.encrypted_content) {
             Ok(share) => {
                 info!("🔑 Created decryption share for message {} (shard {})", msg_id, share.shard_id);
                 
-                // Storing the message and our share
+                // Store the message and our share
                 self.pending_encrypted_messages.insert(msg_id.clone(), encrypted_msg);
-                self.my_decryption_shares.insert(msg_id, share);
+                self.my_decryption_shares.insert(msg_id.clone(), share.clone());
+                
+                // Automatically broadcast our share
+                let response = ShareResponse::new(
+                    msg_id,
+                    self.local_peer_id.to_string(),
+                    self._node_name.clone(),
+                    share
+                );
+                
+                let msg_type = PhoenixMessageType::ShareResponse(response);
+                if let Ok(serialized) = serde_json::to_vec(&msg_type) {
+                    if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized) {
+                        warn!("Failed to broadcast share: {:?}", e);
+                    } else {
+                        info!("📤 Auto-broadcasted my share to network");
+                    }
+                }
             }
             Err(e) => {
                 warn!("❌ Failed to create decryption share: {:?}", e);
             }
+        }
+    }
+
+    // Auto-decrypt when threshold reached
+    fn try_auto_decrypt(&mut self, message_id: &str) {
+        if let Some(encrypted_msg) = self.pending_encrypted_messages.get(message_id) {
+            let mut all_shares = Vec::new();
+            
+            // Add our own share
+            if let Some(my_share) = self.my_decryption_shares.get(message_id) {
+                all_shares.push(my_share.clone());
+            }
+            
+            // Add collected shares from other nodes
+            if let Some(collected) = self.collected_shares.get(message_id) {
+                all_shares.extend(collected.clone());
+            }
+            
+            info!("🔍 Checking decryption: have {}/{} shares for message {}", 
+                  all_shares.len(), self.crypto.threshold, message_id);
+            
+            if all_shares.len() >= self.crypto.threshold {
+                match self.crypto.combine_shares_and_decrypt(&encrypted_msg.encrypted_content, &all_shares) {
+                    Ok(plaintext) => {
+                        info!("🔓 Threshold reached! Decrypting message...");
+                        info!("✅ Decrypted from {}: \"{}\"", encrypted_msg.sender, plaintext);
+                        
+                        // Clean up
+                        self.pending_encrypted_messages.remove(message_id);
+                        self.my_decryption_shares.remove(message_id);
+                        self.collected_shares.remove(message_id);
+                    }
+                    Err(e) => {
+                        warn!("❌ Decryption failed: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Handle share responses
+    fn handle_share_response(&mut self, response: ShareResponse) {
+        let msg_id = &response.message_id;
+        info!("🔑 Received share from {} for message {} (shard {})", 
+              response.provider_name, msg_id, response.share.shard_id);
+        
+        // Store the share
+        self.collected_shares
+            .entry(msg_id.clone())
+            .or_insert_with(Vec::new)
+            .push(response.share);
+        
+        // Try to decrypt automatically
+        self.try_auto_decrypt(msg_id);
+    }
+    
+    // Handle share requests
+    fn handle_share_request(&mut self, topic: &gossipsub::IdentTopic, request: ShareRequest) {
+        info!("📨 Share request from {} for message {}", request.requester_name, request.message_id);
+        
+        if let Some(my_share) = self.my_decryption_shares.get(&request.message_id).cloned() {
+            let response = ShareResponse::new(
+                request.message_id,
+                self.local_peer_id.to_string(),
+                self._node_name.clone(),
+                my_share
+            );
+            
+            let msg_type = PhoenixMessageType::ShareResponse(response);
+            if let Ok(serialized) = serde_json::to_vec(&msg_type) {
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized) {
+                    warn!("Failed to send share response: {:?}", e);
+                } else {
+                    info!("📤 Sent share to {}", request.requester_name);
+                }
+            }
+        } else {
+            info!("❌ No share available for message {}", request.message_id);
         }
     }
 
@@ -247,7 +346,10 @@ impl PhoenixNode {
                 info!("🔒 Encrypted message from {} (ID: {}, needs {}/{} shares)", 
                       encrypted_msg.sender, encrypted_msg.id, encrypted_msg.threshold_needed, 5);
                 
-                self.handle_encrypted_message(encrypted_msg.clone());
+                self.handle_encrypted_message(topic, encrypted_msg.clone());
+
+                // auto-decryption immediately (in case we already have shares)
+                self.try_auto_decrypt(&encrypted_msg.id);
 
                 if encrypted_msg.decrement_ttl() {
                     let msg_type = PhoenixMessageType::Encrypted(encrypted_msg);
@@ -255,6 +357,12 @@ impl PhoenixNode {
                         let _ = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized);
                     }
                 }
+            }
+            Ok(PhoenixMessageType::ShareRequest(request)) => {
+                self.handle_share_request(topic, request);
+            }
+            Ok(PhoenixMessageType::ShareResponse(response)) => {
+                self.handle_share_response(response);
             }
             Err(_) => {
                 // Fallback for raw messages
@@ -288,7 +396,36 @@ impl PhoenixNode {
                                     warn!("❌ Failed to send encrypted message: {:?}", e);
                                 }
                             }
-                        } 
+                        } else if line.starts_with("/request-decrypt ") {
+                            // ADD THIS: Manual share request
+                            let message_id = line.strip_prefix("/request-decrypt ").unwrap_or("").trim();
+                            if !message_id.is_empty() {
+                                let request = ShareRequest::new(
+                                    message_id.to_string(),
+                                    self.local_peer_id.to_string(),
+                                    self._node_name.clone()
+                                );
+                                
+                                let msg_type = PhoenixMessageType::ShareRequest(request);
+                                if let Ok(serialized) = serde_json::to_vec(&msg_type) {
+                                    if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serialized) {
+                                        warn!("Failed to request shares: {:?}", e);
+                                    } else {
+                                        info!("📨 Requesting decryption shares for message {}", message_id);
+                                    }
+                                }
+                            }
+                        } else if line == "/shares" {
+                            // ADD THIS: Show share status
+                            info!("📊 Share Status:");
+                            for (msg_id, encrypted_msg) in &self.pending_encrypted_messages {
+                                let my_shares = if self.my_decryption_shares.contains_key(msg_id) { 1 } else { 0 };
+                                let collected = self.collected_shares.get(msg_id).map(|v| v.len()).unwrap_or(0);
+                                let total = my_shares + collected;
+                                info!("   {} - {}/{} shares (from: {})", 
+                                      &msg_id[..8], total, self.crypto.threshold, encrypted_msg.sender);
+                            }
+                        }
                         else {
                             // plain text message logic
                             let (ttl, content) = if line.contains(':') {
