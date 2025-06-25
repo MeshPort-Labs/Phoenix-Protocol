@@ -79,6 +79,15 @@ impl From<mdns::Event> for PhoenixEvent {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DecryptedMessage {
+    pub id: String,
+    pub sender: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+    pub emergency: bool,
+}
+
 pub struct PhoenixNode {
     swarm: Swarm<PhoenixBehaviour>,
     local_peer_id: PeerId,
@@ -88,6 +97,7 @@ pub struct PhoenixNode {
     my_decryption_shares: HashMap<String, DecryptionShare>,
     _node_name: String,
     collected_shares: HashMap<String, Vec<DecryptionShare>>,
+    message_history: Vec<DecryptedMessage>,
 }
 
 impl PhoenixNode {
@@ -154,6 +164,7 @@ impl PhoenixNode {
             my_decryption_shares: HashMap::new(),
             _node_name: name,
             collected_shares: HashMap::new(),
+            message_history: Vec::new(),
         })
     }
 
@@ -263,6 +274,23 @@ impl PhoenixNode {
                     Ok(plaintext) => {
                         info!("🔓 Threshold reached! Decrypting message...");
                         info!("✅ Decrypted from {}: \"{}\"", encrypted_msg.sender, plaintext);
+
+                        //saveing to history
+                        let is_emergency = plaintext.starts_with("🚨");
+                let decrypted_msg = DecryptedMessage {
+                    id: message_id.to_string(),
+                    sender: encrypted_msg.sender.clone(),
+                    content: plaintext,
+                    timestamp: Utc::now(),
+                    emergency: is_emergency,
+                };
+
+                self.message_history.push(decrypted_msg);
+                
+                // Keep only last 50 messages
+                if self.message_history.len() > 50 {
+                    self.message_history.remove(0);
+                }
                         
                         // Clean up
                         self.pending_encrypted_messages.remove(message_id);
@@ -416,7 +444,6 @@ impl PhoenixNode {
                                 }
                             }
                         } else if line == "/shares" {
-                            // ADD THIS: Show share status
                             info!("📊 Share Status:");
                             for (msg_id, encrypted_msg) in &self.pending_encrypted_messages {
                                 let my_shares = if self.my_decryption_shares.contains_key(msg_id) { 1 } else { 0 };
@@ -425,7 +452,90 @@ impl PhoenixNode {
                                 info!("   {} - {}/{} shares (from: {})", 
                                       &msg_id[..8], total, self.crypto.threshold, encrypted_msg.sender);
                             }
-                        }
+                        } else if line == "/status" {
+                            info!("📊 Phoenix Node Status:");
+                            info!("   🔐 Shard ID: {}", self.crypto.my_shard_id);
+                            info!("   🌐 Connected Peers: {}", self.swarm.connected_peers().count());
+                            info!("   📨 Pending Messages: {}", self.pending_encrypted_messages.len());
+                            info!("   🔑 My Shares: {}", self.my_decryption_shares.len());
+                            info!("   📥 Collected Shares: {}", self.collected_shares.len());
+                            
+                            let ready_to_decrypt: Vec<_> = self.pending_encrypted_messages.keys()
+                                .filter(|msg_id| {
+                                    let my_count = if self.my_decryption_shares.contains_key(*msg_id) { 1 } else { 0 };
+                                    let collected = self.collected_shares.get(*msg_id).map(|v| v.len()).unwrap_or(0);
+                                    (my_count + collected) >= self.crypto.threshold
+                                })
+                                .collect();
+                            
+                            info!("   ✅ Ready to Decrypt: {}", ready_to_decrypt.len());
+                            
+                        } else if line == "/peers" {
+                            // List connected peers with details
+                            info!("👥 Connected Peers:");
+                            let peers: Vec<_> = self.swarm.connected_peers().collect();
+                            if peers.is_empty() {
+                                info!("   No peers connected");
+                            } else {
+                                for (i, peer) in peers.iter().enumerate() {
+                                    info!("   {}. {}", i + 1, peer);
+                                }
+                            }
+                            
+                        } else if line.starts_with("/decrypt ") {
+                            // Manually decrypt specific message
+                            let message_id = line.strip_prefix("/decrypt ").unwrap_or("").trim();
+                            if !message_id.is_empty() {
+                                if self.pending_encrypted_messages.contains_key(message_id) {
+                                    self.try_auto_decrypt(message_id);
+                                } else {
+                                    info!("❌ Message {} not found in pending messages", message_id);
+                                }
+                            }
+                            
+                        } else if line.starts_with("/emergency ") {
+                            // Send emergency broadcast
+                            let content = line.strip_prefix("/emergency ").unwrap_or("");
+                            let connected_peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
+                            
+                            if connected_peers.is_empty() {
+                                warn!("❌ No connected peers for emergency broadcast");
+                            } else {
+                                // Create emergency message with special formatting
+                                let emergency_content = format!("🚨 EMERGENCY: {}", content);
+                                if let Err(e) = self.send_encrypted_message(&topic, &emergency_content, 10).await {
+                                    warn!("❌ Failed to send emergency message: {:?}", e);
+                                } else {
+                                    info!("🚨 Emergency broadcast sent to {} peers", connected_peers.len());
+                                }
+                            }
+                                for (i, msg) in self.message_history.iter().rev().take(10).enumerate() {
+                                    let prefix = if msg.emergency { "🚨" } else { "📨" };
+                                    info!("   {}. {} [{}]: {}", 
+                                          i + 1, prefix, &msg.sender[..12], 
+                                          if msg.content.len() > 50 { 
+                                              format!("{}...", &msg.content[..50]) 
+                                          } else { 
+                                              msg.content.clone() 
+                                          });
+                                }
+                            } else if line == "/history" {
+                                info!("📜 Message History:");
+                                if self.message_history.is_empty() {
+                                    info!("   No messages in history");
+                                } else {
+                                    for (i, msg) in self.message_history.iter().rev().take(10).enumerate() {
+                                        let prefix = if msg.emergency { "🚨" } else { "📨" };
+                                        info!("   {}. {} [{}]: {}", 
+                                              i + 1, prefix, &msg.sender[..12], 
+                                              if msg.content.len() > 50 { 
+                                                  format!("{}...", &msg.content[..50]) 
+                                              } else { 
+                                                  msg.content.clone() 
+                                              });
+                                    }
+                                } 
+                            }
                         else {
                             // plain text message logic
                             let (ttl, content) = if line.contains(':') {
