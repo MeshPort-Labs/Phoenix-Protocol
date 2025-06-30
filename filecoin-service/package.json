@@ -1,0 +1,16 @@
+{
+  "name": "filecoin-service",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.3",
+    "@web3-storage/w3up-client": "^17.3.0",
+    "express": "^5.1.0"
+  }
+}
