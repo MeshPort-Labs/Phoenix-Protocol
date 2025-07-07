@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
 use crate::crypto::{DecryptionShare, EncryptedMessage, ShareRequest, ShareResponse, ThresholdCrypto };
+use crate::filecoin::{FilecoinClient, ThresholdMessage};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PhoenixMessage {
@@ -98,6 +99,7 @@ pub struct PhoenixNode {
     _node_name: String,
     collected_shares: HashMap<String, Vec<DecryptionShare>>,
     message_history: Vec<DecryptedMessage>,
+    pub filecoin_client: Option<FilecoinClient>,
 }
 
 impl PhoenixNode {
@@ -155,6 +157,12 @@ impl PhoenixNode {
         
         info!("🔐 Node '{}' crypto initialized: {}", name, crypto.get_info());
 
+        let filecoin_client = Some(FilecoinClient::new(
+            "http://localhost:8080".to_string(),
+            3, // threshold
+            9, // total shards
+        ));
+
         Ok(Self { 
             swarm, 
             local_peer_id, 
@@ -165,6 +173,7 @@ impl PhoenixNode {
             _node_name: name,
             collected_shares: HashMap::new(),
             message_history: Vec::new(),
+            filecoin_client
         })
     }
 
@@ -215,6 +224,38 @@ impl PhoenixNode {
                 Err(anyhow::anyhow!("Failed to publish: {:?}", e))
             }
         }
+    }
+
+    pub async fn send_encrypted_message_with_storage(&mut self, topic: &gossipsub::IdentTopic, content: &str, ttl: u32) -> anyhow::Result<()> {
+        if let Some(ref mut filecoin_client) = self.filecoin_client {
+            // Create threshold message
+            let threshold_msg = filecoin_client.threshold_storage.create_threshold_message(
+                &self.crypto,
+                content,
+                &self.local_peer_id.to_string(),
+                content.starts_with("🚨") // Emergency if starts with alert emoji
+            ).map_err(|e| anyhow::anyhow!("Failed to create threshold message: {}", e))?;
+            
+            // Store in Filecoin
+            match filecoin_client.store_threshold_message(threshold_msg.clone()).await {
+                Ok(manifest) => {
+                    info!("✅ Message stored in Filecoin: {}", manifest.manifest_cid);
+                    
+                    // Still send the encrypted message via mesh for immediate delivery
+                    self.send_encrypted_message(topic, content, ttl).await?;
+                }
+                Err(e) => {
+                    warn!("⚠️ Filecoin storage failed, using mesh only: {}", e);
+                    // Fallback to mesh-only
+                    self.send_encrypted_message(topic, content, ttl).await?;
+                }
+            }
+        } else {
+            // No Filecoin client, use mesh only
+            self.send_encrypted_message(topic, content, ttl).await?;
+        }
+        
+        Ok(())
     }
 
     fn handle_encrypted_message(&mut self, topic: &gossipsub::IdentTopic, encrypted_msg: EncryptedMessage) {
@@ -399,6 +440,30 @@ impl PhoenixNode {
         }
     }
 
+    // Add command handlers for Filecoin operations
+    pub async fn handle_filecoin_status(&mut self) {
+        if let Some(ref filecoin_client) = self.filecoin_client {
+            match filecoin_client.check_status().await {
+                Ok(status) => {
+                    info!("📊 Filecoin Status:");
+                    info!("   Connected: {}", status.connected);
+                    info!("   Network: {}", status.network);
+                    if let Some(latency) = status.latency {
+                        info!("   Latency: {}ms", latency);
+                    }
+                    
+                    let (cache_count, _) = filecoin_client.get_emergency_cache_status();
+                    info!("   Emergency Cache: {} messages", cache_count);
+                }
+                Err(e) => {
+                    warn!("❌ Filecoin status check failed: {}", e);
+                }
+            }
+        } else {
+            info!("❌ Filecoin client not initialized");
+        }
+    }
+
     pub async fn run(mut self, topic_str: &str) -> anyhow::Result<()> {
         let topic = gossipsub::IdentTopic::new(topic_str);
 
@@ -535,6 +600,26 @@ impl PhoenixNode {
                                               });
                                     }
                                 } 
+                            } else if line == "/filecoin" {
+                                self.handle_filecoin_status().await;
+                            } else if line.starts_with("/store ") {
+                                let content = line.strip_prefix("/store ").unwrap_or("");
+                                if let Err(e) = self.send_encrypted_message_with_storage(&topic, content, 5).await {
+                                    warn!("❌ Failed to store message: {:?}", e);
+                                }
+                            } else if line == "/emergency-mode" {
+                                if let Some(ref mut filecoin_client) = self.filecoin_client {
+                                    if let Err(e) = filecoin_client.emergency_broadcast_mode(true).await {
+                                        warn!("❌ Failed to enable emergency mode: {}", e);
+                                    }
+                                }
+                            } else if line == "/routing-check" {
+                                if let Some(ref filecoin_client) = self.filecoin_client {
+                                    match filecoin_client.adaptive_routing_check().await {
+                                        Ok(mode) => info!("🔄 Current routing mode: {}", mode),
+                                        Err(e) => warn!("❌ Routing check failed: {}", e),
+                                    }
+                                }
                             }
                         else {
                             // plain text message logic
